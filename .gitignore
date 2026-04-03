@@ -1,0 +1,44 @@
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# Database files
+*.db
+*.db-journal
+*.db.bak
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node modules
+node_modules/
+scripts/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Backup files
+*.bak
+*.backup
+*.rs.bak
+
+# Scripts - only keep swap.js
+scripts/package-lock.json
+
+# Scripts - only keep swap.js
+scripts/package*.json
+*.bak2
