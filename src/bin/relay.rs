@@ -1138,7 +1138,7 @@ async fn execute_jupiter_swap(
         amount_lamports, output_mint, destination);
 
     let output = Command::new("node")
-        .arg("/root/stealth-diffusion-protocol-maze/scripts/swap.js")
+        .arg("./scripts/swap.js")
         .arg(&privkey_bs58)
         .arg(amount_lamports.to_string())
         .arg(output_mint)

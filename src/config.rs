@@ -19,7 +19,7 @@ pub const FEE_WALLET: &str = "Nd5yLUNpZwqQ9GzMt1TmbwBNfR5EYpjrNWuHbQh9SDP";
 
 /// Database path
 pub const DB_PATH: &str = "maze_relay.db";
-pub const SHARED_DB_PATH: &str = "/root/kausalayer/relay_data.db";
+pub const SHARED_DB_PATH: &str = "shared_relay.db";
 
 /// Autopurge interval (24 hours in seconds)
 pub const AUTOPURGE_SECONDS: i64 = 86400;
