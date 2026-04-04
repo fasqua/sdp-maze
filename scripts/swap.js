@@ -39,7 +39,7 @@ async function main() {
 
     const [privkeyBs58, amountLamports, outputMint, destinationWallet] = args;
 
-    const rpcUrl = 'https://mainnet.helius-rpc.com/?api-key=28fd4aa0-0bdf-4652-94c5-d2e66bd68344';
+    const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
     const connection = new Connection(rpcUrl, 'confirmed');
     const keypair = Keypair.fromSecretKey(bs58.decode(privkeyBs58));
     const jupiter = createJupiterApiClient();
