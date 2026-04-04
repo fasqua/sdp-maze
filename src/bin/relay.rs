@@ -1137,7 +1137,9 @@ async fn execute_jupiter_swap(
     info!("Calling Jupiter swap script: {} lamports -> {} to {}",
         amount_lamports, output_mint, destination);
 
+    let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
     let output = Command::new("node")
+        .env("SOLANA_RPC_URL", &rpc_url)
         .arg("./scripts/swap.js")
         .arg(&privkey_bs58)
         .arg(amount_lamports.to_string())
