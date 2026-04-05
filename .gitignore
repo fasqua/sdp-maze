@@ -42,3 +42,9 @@ scripts/package-lock.json
 # Scripts - only keep swap.js
 scripts/package*.json
 *.bak2
+
+# Backup files
+*.bak
+*.bak_*
+*.bak2
+*.bak3

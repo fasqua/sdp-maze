@@ -75,6 +75,19 @@ pub struct MazeRequest {
     pub sender_meta_hash: Option<String>,
 }
 
+/// User maze preferences (for KAUSA holders)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MazePreferencesRow {
+    pub owner_meta_hash: String,
+    pub hop_count: i32,
+    pub split_ratio: f64,
+    pub merge_strategy: String,
+    pub delay_pattern: String,
+    pub delay_ms: i64,
+    pub delay_scope: String,
+    pub updated_at: i64,
+}
+
 /// Database wrapper with encryption
 pub struct RelayDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -191,7 +204,8 @@ impl RelayDatabase {
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
-                completed_at INTEGER
+                completed_at INTEGER,
+                maze_config_json TEXT
             );
 
             -- Diversify routes table (links to child maze requests)
@@ -219,6 +233,20 @@ impl RelayDatabase {
             CREATE INDEX IF NOT EXISTS idx_completed_receiver ON completed_transfers(receiver_meta);
             CREATE INDEX IF NOT EXISTS idx_diversify_requests_status ON diversify_requests(status);
             CREATE INDEX IF NOT EXISTS idx_diversify_routes_parent ON diversify_routes(parent_id);
+
+            -- User maze preferences (for KAUSA holders)
+            CREATE TABLE IF NOT EXISTS maze_preferences (
+                owner_meta_hash TEXT PRIMARY KEY,
+                hop_count INTEGER DEFAULT 10,
+                split_ratio REAL DEFAULT 1.618,
+                merge_strategy TEXT DEFAULT 'random',
+                delay_pattern TEXT DEFAULT 'none',
+                delay_ms INTEGER DEFAULT 0,
+                delay_scope TEXT DEFAULT 'node',
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_maze_preferences_updated ON maze_preferences(updated_at);
         "#)?;
 
         Ok(())
@@ -765,6 +793,7 @@ impl RelayDatabase {
         
         let wallets = stmt.query_map(params![owner_meta_hash], |row| {
             Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+
         })?;
         
         wallets.collect::<std::result::Result<Vec<_>, _>>()
@@ -814,6 +843,7 @@ impl RelayDatabase {
         route_count: usize,
         distribution_mode: &str,
         expires_in_secs: i64,
+        maze_config_json: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -823,8 +853,8 @@ impl RelayDatabase {
             r#"INSERT INTO diversify_requests (
                 id, meta_address, deposit_address, deposit_keypair_encrypted,
                 total_amount, fee_amount, route_count, distribution_mode,
-                status, created_at, expires_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10)"#,
+                status, created_at, expires_at, maze_config_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11)"#,
             params![
                 id,
                 meta_address,
@@ -836,6 +866,7 @@ impl RelayDatabase {
                 distribution_mode,
                 now,
                 expires_at,
+                maze_config_json,
             ],
         )?;
 
@@ -885,11 +916,11 @@ impl RelayDatabase {
     }
 
     /// Get diversify request by ID
-    pub fn get_diversify_request(&self, id: &str) -> Result<Option<(String, String, Vec<u8>, u64, u64, String, i64, String)>> {
+    pub fn get_diversify_request(&self, id: &str) -> Result<Option<(String, String, Vec<u8>, u64, u64, String, i64, String, Option<String>)>> {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT deposit_address, status, deposit_keypair_encrypted, total_amount, fee_amount, distribution_mode, expires_at, meta_address 
+            "SELECT deposit_address, status, deposit_keypair_encrypted, total_amount, fee_amount, distribution_mode, expires_at, meta_address, maze_config_json 
              FROM diversify_requests WHERE id = ?1"
         )?;
 
@@ -903,6 +934,7 @@ impl RelayDatabase {
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         });
 
@@ -1003,6 +1035,81 @@ impl RelayDatabase {
         Ok(())
     }
 
+
+    // ============ MAZE PREFERENCES ============
+
+    /// Get maze preferences for user
+    pub fn get_maze_preferences(&self, owner_meta_hash: &str) -> Result<Option<MazePreferencesRow>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT hop_count, split_ratio, merge_strategy, delay_pattern, delay_ms, delay_scope, updated_at FROM maze_preferences WHERE owner_meta_hash = ?1"
+        )?;
+
+        let result = stmt.query_row(params![owner_meta_hash], |row| {
+            Ok(MazePreferencesRow {
+                owner_meta_hash: owner_meta_hash.to_string(),
+                hop_count: row.get(0)?,
+                split_ratio: row.get(1)?,
+                merge_strategy: row.get(2)?,
+                delay_pattern: row.get(3)?,
+                delay_ms: row.get(4)?,
+                delay_scope: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        });
+
+        match result {
+            Ok(prefs) => Ok(Some(prefs)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Save maze preferences for user (upsert)
+    pub fn save_maze_preferences(&self, prefs: &MazePreferencesRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        conn.execute(
+            r#"INSERT INTO maze_preferences (owner_meta_hash, hop_count, split_ratio, merge_strategy, delay_pattern, delay_ms, delay_scope, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               ON CONFLICT(owner_meta_hash) DO UPDATE SET
+                   hop_count = excluded.hop_count,
+                   split_ratio = excluded.split_ratio,
+                   merge_strategy = excluded.merge_strategy,
+                   delay_pattern = excluded.delay_pattern,
+                   delay_ms = excluded.delay_ms,
+                   delay_scope = excluded.delay_scope,
+                   updated_at = excluded.updated_at"#,
+            params![
+                prefs.owner_meta_hash,
+                prefs.hop_count,
+                prefs.split_ratio,
+                prefs.merge_strategy,
+                prefs.delay_pattern,
+                prefs.delay_ms,
+                prefs.delay_scope,
+                prefs.updated_at,
+            ],
+        )?;
+
+        Ok(())
+
+    }
+    /// Check if user has active Pro subscription
+    pub fn is_pro_subscriber(&self, meta_address_hash: &str) -> bool {
+        let conn = self.shared_conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let result: std::result::Result<i32, rusqlite::Error> = conn.query_row(
+            "SELECT COUNT(*) FROM subscriptions WHERE meta_address_hash = ?1 AND is_active = 1 AND expires_at > ?2",
+            params![meta_address_hash, now],
+            |row| row.get(0)
+        );
+        match result {
+            Ok(count) => count > 0,
+            Err(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]

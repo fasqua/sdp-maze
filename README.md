@@ -83,6 +83,8 @@ Blockchain transactions can fail for various reasons (network congestion, RPC is
 - **Ownership Validation** - Only the original sender can recover funds
 - **Single Command** - Simple `recover [request_id]` interface
 
+**Important:** You must register at least one destination wallet (`add1 [address]`) before using SDP Maze. Recovery funds are sent to your first registered wallet (slot 1) by default.
+
 ## How It Works
 
 ### Maze Generation
@@ -143,7 +145,23 @@ The maze structure is determined by:
 
 - **Protocol Fee**: 0.5% of transfer amount
 - **Network Fees**: ~0.000005 SOL per node transaction
-- **Subscriber Discount**: 0% protocol fee for KAUSA holders
+- **Pro Subscriber**: 0% protocol fee (requires active subscription)
+- **Network Buffer**: 0.01 SOL safety buffer for diversify operations
+
+### Custom Maze Configuration (KAUSA Holders)
+
+Users holding 1,000,000+ KAUSA tokens can customize their maze parameters:
+
+| Parameter | Range | Default | Description |
+|-----------|-------|---------|-------------|
+| Hop Count | 5-10 | 10 | Number of intermediate nodes |
+| Split Ratio | 1.1-3.0 | 1.618 (Golden Ratio) | How funds split at branch points |
+| Merge Strategy | early/late/middle/random/fibonacci | random | When parallel paths recombine |
+| Delay Pattern | none/linear/exponential/random/fibonacci | none | Timing between transactions |
+| Delay (ms) | 0-5000 | 0 | Base delay in milliseconds |
+| Delay Scope | node/level | node | Apply delay per node or per level |
+
+Preferences are saved and automatically applied to future transactions.
 
 ## Privacy Model
 
@@ -338,7 +356,9 @@ Request:
 {
   "sender_meta_hash": "string",
   "receiver_meta": "string (kl_address)",
-  "amount_sol": number
+  "amount_sol": number,
+  "hop_count": number (optional),
+  "maze_config": { ... } (optional, for KAUSA holders)
 }
 ```
 
@@ -367,7 +387,8 @@ Request:
   "sender_meta_hash": "string",
   "amount_sol": number,
   "token_mint": "string (SPL token address)",
-  "destination": "string (wallet address)"
+  "destination": "string (wallet address)",
+  "maze_config": { ... } (optional, for KAUSA holders)
 }
 ```
 
@@ -396,7 +417,8 @@ Request:
 {
   "meta_address": "string",
   "total_amount": number,
-  "distribution_mode": "equal" | "weighted",
+  "distribution_mode": "equal" | "percentage" | "fixed",
+  "maze_config": { ... } (optional, for KAUSA holders),
   "routes": [
     {
       "destination_slot": number,
@@ -472,6 +494,44 @@ Response:
   "recovered_amount": number,
   "tx_signatures": ["string"],
   "error": "string | null"
+}
+```
+
+### Maze Preferences (KAUSA Holders)
+
+**POST /api/v1/preferences/get**
+```json
+{
+  "meta_address": "string"
+}
+```
+
+Response:
+```json
+{
+  "success": true,
+  "preferences": {
+    "hop_count": 10,
+    "split_ratio": 1.618,
+    "merge_strategy": "random",
+    "delay_pattern": "none",
+    "delay_ms": 0,
+    "delay_scope": "node",
+    "updated_at": 1234567890
+  }
+}
+```
+
+**POST /api/v1/preferences/save**
+```json
+{
+  "meta_address": "string",
+  "hop_count": 10,
+  "split_ratio": 1.618,
+  "merge_strategy": "random",
+  "delay_pattern": "none",
+  "delay_ms": 0,
+  "delay_scope": "node"
 }
 ```
 

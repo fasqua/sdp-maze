@@ -9,5 +9,6 @@ pub use database::{
     RelayDatabase, 
     MazeRequest, 
     RequestStatus,
+    MazePreferencesRow,
 };
 pub use maze::{MazeGraph, MazeGenerator, MazeNode};

@@ -71,6 +71,10 @@ pub struct MazeParameters {
     pub delay_pattern: DelayPattern,
     /// Amount variation percentage (0.01% - 1%)
     pub amount_noise: f64,
+    /// Base delay in milliseconds (0-5000)
+    pub delay_ms: u64,
+    /// Delay scope: per node or per level
+    pub delay_scope: DelayScope,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -91,6 +95,13 @@ pub enum DelayPattern {
     None,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+pub enum DelayScope {
+    #[default]
+    Node,
+    Level,
+}
+
 impl Default for MazeParameters {
     fn default() -> Self {
         Self {
@@ -101,6 +112,8 @@ impl Default for MazeParameters {
             merge_strategy: MergeStrategy::Random,
             delay_pattern: DelayPattern::None, // No delay for speed
             amount_noise: 0.1, // 0.1% noise
+            delay_ms: 0, // No delay by default
+            delay_scope: DelayScope::Node, // Per node by default
         }
     }
 }
@@ -125,6 +138,8 @@ impl MazeParameters {
             },
             delay_pattern: DelayPattern::None,
             amount_noise: rng.gen_range(0.01..1.0),
+            delay_ms: 0, // No delay for random (speed priority)
+            delay_scope: DelayScope::Node,
         }
     }
 

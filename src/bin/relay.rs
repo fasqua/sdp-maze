@@ -33,10 +33,11 @@ use sdp_maze::{
 use sdp_maze::config::{
     FEE_PERCENT, TX_FEE_LAMPORTS, MIN_AMOUNT_SOL, EXPIRY_SECONDS, FEE_WALLET,
     MazeParameters, MIN_HOPS, MAX_HOPS,
+    MergeStrategy, DelayPattern, DelayScope,
 };
 use sdp_maze::relay::{
     RelayDatabase, MazeRequest, RequestStatus,
-    MazeGraph, MazeGenerator,
+    MazeGraph, MazeGenerator, MazePreferencesRow,
 };
 use sdp_maze::core::utils::{lamports_to_sol, sol_to_lamports};
 
@@ -83,6 +84,23 @@ impl IntoResponse for AppError {
 
 // ============ API TYPES ============
 
+// Custom maze configuration (for KAUSA holders)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CustomMazeConfig {
+    #[serde(default)]
+    hop_count: Option<u8>,
+    #[serde(default)]
+    split_ratio: Option<f64>,
+    #[serde(default)]
+    merge_strategy: Option<String>,
+    #[serde(default)]
+    delay_pattern: Option<String>,
+    #[serde(default)]
+    delay_ms: Option<u64>,
+    #[serde(default)]
+    delay_scope: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateTransferRequest {
     sender_meta_hash: String,
@@ -90,6 +108,8 @@ struct CreateTransferRequest {
     amount_sol: f64,
     #[serde(default)]
     hop_count: Option<u8>,
+    #[serde(default)]
+    maze_config: Option<CustomMazeConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +304,8 @@ struct SwapRequest {
     amount_sol: f64,
     token_mint: String,
     destination: String,
+    #[serde(default)]
+    maze_config: Option<CustomMazeConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -313,6 +335,8 @@ struct DiversifyRequest {
     total_amount: f64,
     distribution_mode: String,
     routes: Vec<DiversifyRouteInput>,
+    #[serde(default)]
+    maze_config: Option<CustomMazeConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -336,6 +360,49 @@ struct DiversifyResponse {
     maze_preview: Option<MazePreview>,
     error: Option<String>,
 }
+
+// ============ MAZE PREFERENCES TYPES ============
+
+#[derive(Debug, Deserialize)]
+struct GetPreferencesRequest {
+    meta_address: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GetPreferencesResponse {
+    success: bool,
+    preferences: Option<MazePreferencesData>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MazePreferencesData {
+    hop_count: u8,
+    split_ratio: f64,
+    merge_strategy: String,
+    delay_pattern: String,
+    delay_ms: u64,
+    delay_scope: String,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SavePreferencesRequest {
+    meta_address: String,
+    hop_count: Option<u8>,
+    split_ratio: Option<f64>,
+    merge_strategy: Option<String>,
+    delay_pattern: Option<String>,
+    delay_ms: Option<u64>,
+    delay_scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SavePreferencesResponse {
+    success: bool,
+    error: Option<String>,
+}
+
 
 #[derive(Debug, Deserialize)]
 struct DiversifyStatusQuery {
@@ -376,6 +443,68 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
+#[derive(Debug, Serialize)]
+struct BlockhashResponse {
+    blockhash: String,
+}
+
+async fn blockhash_handler(
+    State(state): State<SharedState>,
+) -> Result<Json<BlockhashResponse>, AppError> {
+    let blockhash = state.rpc.get_latest_blockhash()
+        .map_err(|e| MazeError::RpcError(e.to_string()))?;
+    Ok(Json(BlockhashResponse {
+        blockhash: blockhash.to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitRequest {
+    signed_tx: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitResponse {
+    status: String,
+    signature: Option<String>,
+    message: Option<String>,
+}
+
+async fn submit_handler(
+    State(state): State<SharedState>,
+    Json(req): Json<SubmitRequest>,
+) -> Result<Json<SubmitResponse>, AppError> {
+    use solana_sdk::transaction::Transaction;
+    use solana_transaction_status::UiTransactionEncoding;
+    
+    // Decode base64 transaction
+    let tx_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.signed_tx)
+        .map_err(|e| MazeError::CryptoError(format!("Invalid base64: {}", e)))?;
+    
+    let tx: Transaction = bincode::deserialize(&tx_bytes)
+        .map_err(|e| MazeError::CryptoError(format!("Invalid transaction: {}", e)))?;
+    
+    // Send transaction
+    match state.rpc.send_and_confirm_transaction(&tx) {
+        Ok(sig) => {
+            info!("Transaction submitted: {}", sig);
+            Ok(Json(SubmitResponse {
+                status: "success".to_string(),
+                signature: Some(sig.to_string()),
+                message: None,
+            }))
+        }
+        Err(e) => {
+            error!("Transaction failed: {}", e);
+            Ok(Json(SubmitResponse {
+                status: "error".to_string(),
+                signature: None,
+                message: Some(e.to_string()),
+            }))
+        }
+    }
+}
+
 async fn create_transfer_handler(
     State(state): State<SharedState>,
     Json(req): Json<CreateTransferRequest>,
@@ -393,17 +522,69 @@ async fn create_transfer_handler(
     }
 
     let amount_lamports = sol_to_lamports(req.amount_sol);
-    let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
+    
+    // Hash sender meta address for subscription check
+    let mut hasher = Sha256::new();
+    hasher.update(req.sender_meta_hash.as_bytes());
+    let sender_hash = format!("{:x}", hasher.finalize());
 
-    // Set hop count (with bounds)
-    let hop_count = req.hop_count
-        .unwrap_or(10)
-        .max(MIN_HOPS)
-        .min(MAX_HOPS);
+    // Check if sender is Pro subscriber (fee = 0)
+    let fee_lamports = if state.db.is_pro_subscriber(&sender_hash) {
+        info!("Pro subscriber detected, fee = 0");
+        0
+    } else {
+        (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64
+    };
 
-    // Generate maze parameters
-    let mut params = MazeParameters::random();
-    params.hop_count = hop_count;
+    // Generate maze parameters (custom config or random)
+    let params = if let Some(config) = req.maze_config {
+        let mut p = MazeParameters::default();
+        if let Some(hops) = config.hop_count {
+            p.hop_count = hops.max(MIN_HOPS).min(MAX_HOPS);
+        } else if let Some(hops) = req.hop_count {
+            p.hop_count = hops.max(MIN_HOPS).min(MAX_HOPS);
+        }
+        if let Some(ratio) = config.split_ratio {
+            p.split_ratio = ratio.max(1.1).min(3.0);
+        }
+        if let Some(ref strategy) = config.merge_strategy {
+            p.merge_strategy = match strategy.as_str() {
+                "early" => MergeStrategy::Early,
+                "late" => MergeStrategy::Late,
+                "middle" => MergeStrategy::Middle,
+                "fibonacci" => MergeStrategy::Fibonacci,
+                _ => MergeStrategy::Random,
+            };
+        }
+        if let Some(ref pattern) = config.delay_pattern {
+            p.delay_pattern = match pattern.as_str() {
+                "linear" => DelayPattern::Linear,
+                "exponential" => DelayPattern::Exponential,
+                "random" => DelayPattern::Random,
+                "fibonacci" => DelayPattern::Fibonacci,
+                _ => DelayPattern::None,
+            };
+        }
+        if let Some(ms) = config.delay_ms {
+            p.delay_ms = ms.min(5000);
+        }
+        if let Some(ref scope) = config.delay_scope {
+            p.delay_scope = match scope.as_str() {
+                "level" => DelayScope::Level,
+                _ => DelayScope::Node,
+            };
+        }
+        info!("Using CUSTOM maze config: hop_count={}, split_ratio={:.2}, merge={:?}, delay={:?} {}ms scope={:?}", p.hop_count, p.split_ratio, p.merge_strategy, p.delay_pattern, p.delay_ms, p.delay_scope);
+        p
+    } else {
+        let mut p = MazeParameters::random();
+        if let Some(hops) = req.hop_count {
+            p.hop_count = hops.max(MIN_HOPS).min(MAX_HOPS);
+        }
+        info!("Using RANDOM maze config: hop_count={}, split_ratio={:.2}, merge={:?}, delay={:?} {}ms", p.hop_count, p.split_ratio, p.merge_strategy, p.delay_pattern, p.delay_ms);
+        p
+    };
+
 
     // Create stealth address for receiver
     let stealth = create_stealth_address(&meta)?;
@@ -445,7 +626,7 @@ async fn create_transfer_handler(
         completed_at: None,
         final_tx_signature: None,
         error_message: None,
-        sender_meta_hash: Some(req.sender_meta_hash.clone()),
+        sender_meta_hash: Some(sender_hash.clone()),
     };
 
     // Store in database
@@ -479,7 +660,7 @@ async fn get_status_handler(
     // Check if this is a diversify request
     if request_id.starts_with("div_") && !request_id.contains("_route_") {
         // Get diversify request status
-        if let Ok(Some((deposit_address, status, _, total_amount, _, route_count, _, _))) = 
+        if let Ok(Some((deposit_address, status, _, total_amount, _, route_count, _, _, _))) = 
             state.db.get_diversify_request(&request_id) 
         {
             // Get routes for progress
@@ -593,19 +774,23 @@ async fn scan_handler(
     let _meta = MetaAddress::decode(&req.receiver_meta)?;
 
     let transfers = state.db.scan_transfers(&req.receiver_meta)?;
-
-    let transfer_infos: Vec<TransferInfo> = transfers
-        .into_iter()
-        .map(|(stealth, ephemeral, amount, tx_sig, completed_at)| {
-            TransferInfo {
-                stealth_pubkey: stealth,
-                ephemeral_pubkey: ephemeral,
-                amount_sol: lamports_to_sol(amount),
-                tx_signature: tx_sig,
-                completed_at,
+    let mut transfer_infos: Vec<TransferInfo> = Vec::new();
+    
+    for (stealth, ephemeral, _amount, tx_sig, completed_at) in transfers {
+        // Check on-chain balance - only include if still has funds
+        if let Ok(stealth_pubkey) = stealth.parse::<Pubkey>() {
+            let balance = state.rpc.get_balance(&stealth_pubkey).unwrap_or(0);
+            if balance > 5000 {  // More than dust (network fee)
+                transfer_infos.push(TransferInfo {
+                    stealth_pubkey: stealth,
+                    ephemeral_pubkey: ephemeral,
+                    amount_sol: lamports_to_sol(balance),
+                    tx_signature: tx_sig,
+                    completed_at,
+                });
             }
-        })
-        .collect();
+        }
+    }
 
     Ok(Json(ScanResponse {
         transfers: transfer_infos,
@@ -691,7 +876,7 @@ async fn deposit_monitor_task(state: SharedState) {
         // Monitor diversify requests
         if let Ok(div_requests) = state.db.get_pending_diversify_requests() {
             for div_id in div_requests {
-                if let Ok(Some((deposit_address, status, keypair_encrypted, total_amount, fee_amount, _mode, _expires, _meta))) = state.db.get_diversify_request(&div_id) {
+                if let Ok(Some((deposit_address, status, keypair_encrypted, total_amount, fee_amount, _mode, _expires, _meta, _))) = state.db.get_diversify_request(&div_id) {
                     if status == "pending" {
                         if let Ok(pubkey) = Pubkey::from_str(&deposit_address) {
                             if let Ok(balance) = state.rpc.get_balance(&pubkey) {
@@ -714,6 +899,34 @@ async fn deposit_monitor_task(state: SharedState) {
                     }
                 }
             }
+        }
+    }
+}
+
+
+/// Calculate delay based on pattern and level/node
+fn calculate_delay(pattern: &DelayPattern, base_ms: u64, index: u8) -> u64 {
+    match pattern {
+        DelayPattern::None => 0,
+        DelayPattern::Linear => base_ms * (index as u64 + 1),
+        DelayPattern::Exponential => base_ms * 2u64.pow(index as u32),
+        DelayPattern::Random => {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            rng.gen_range(0..=base_ms * 2)
+        }
+        DelayPattern::Fibonacci => {
+            let fib = |n: u8| -> u64 {
+                let mut a = 0u64;
+                let mut b = 1u64;
+                for _ in 0..n {
+                    let tmp = a;
+                    a = b;
+                    b = tmp.saturating_add(b);
+                }
+                a
+            };
+            base_ms * fib(index + 1)
         }
     }
 }
@@ -744,12 +957,28 @@ async fn execute_maze(state: SharedState, request_id: &str) -> Result<(), MazeEr
             match execute_node(&state, request_id, node).await {
                 Ok(_) => {
                     info!("Node {} level {} completed", node.index, level);
+                    // Apply delay if configured (Node scope)
+                    if maze.parameters.delay_scope == DelayScope::Node && maze.parameters.delay_ms > 0 {
+                        let delay = calculate_delay(&maze.parameters.delay_pattern, maze.parameters.delay_ms, node.index as u8);
+                        if delay > 0 {
+                            info!("Delay {}ms after node {}", delay, node.index);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Node {} failed: {}", node.index, e);
                     state.db.update_request_status(request_id, RequestStatus::SwapFailed)?;
                     return Err(e);
                 }
+            }
+        }
+        // Apply delay if configured (Level scope)
+        if maze.parameters.delay_scope == DelayScope::Level && maze.parameters.delay_ms > 0 {
+            let delay = calculate_delay(&maze.parameters.delay_pattern, maze.parameters.delay_ms, level);
+            if delay > 0 {
+                info!("Delay {}ms after level {}", delay, level);
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
             }
         }
     }
@@ -906,9 +1135,31 @@ async fn execute_maze(state: SharedState, request_id: &str) -> Result<(), MazeEr
         return Ok(());
     }
 
+    // Transfer protocol fee to fee wallet first (if not Pro subscriber)
+    if request.fee_lamports > 0 {
+        let fee_wallet = Pubkey::from_str(FEE_WALLET).unwrap();
+        let fee_blockhash = state.rpc.get_latest_blockhash()?;
+        let fee_ix = system_instruction::transfer(&final_keypair.pubkey(), &fee_wallet, request.fee_lamports);
+        let fee_tx = Transaction::new_signed_with_payer(
+            &[fee_ix],
+            Some(&final_keypair.pubkey()),
+            &[&final_keypair],
+            fee_blockhash,
+        );
+        if let Err(e) = state.rpc.send_and_confirm_transaction(&fee_tx) {
+            error!("Fee transfer failed: {}", e);
+        } else {
+            info!("Fee transferred to fee wallet: {} lamports", request.fee_lamports);
+        }
+    }
+
     // Normal transfer to stealth address
     let stealth_pubkey = Pubkey::from_str(&request.stealth_pubkey)
         .map_err(|e| MazeError::InvalidParameters(e.to_string()))?;
+
+    // Recalculate transfer amount after fee
+    let current_balance = state.rpc.get_balance(&final_keypair.pubkey())?;
+    let transfer_amount = current_balance.saturating_sub(TX_FEE_LAMPORTS);
 
     let recent_blockhash = state.rpc.get_latest_blockhash().map_err(|e| MazeError::RpcError(e.to_string()))?;
 
@@ -950,7 +1201,7 @@ async fn execute_diversify(state: SharedState, parent_id: &str) -> Result<(), Ma
     state.db.update_diversify_status(parent_id, "processing")?;
 
     // Get parent request info
-    let (deposit_address, _status, keypair_encrypted, total_amount, fee_amount, _mode, _expires, meta_address) = 
+    let (deposit_address, _status, keypair_encrypted, total_amount, fee_amount, _mode, _expires, meta_address, maze_config_json) = 
         state.db.get_diversify_request(parent_id)?
             .ok_or_else(|| MazeError::RequestNotFound(parent_id.into()))?;
 
@@ -1014,10 +1265,54 @@ async fn execute_diversify(state: SharedState, parent_id: &str) -> Result<(), Ma
 
         info!("Route {}: {} lamports -> {} [last={}]", route_idx, actual_amount, dest_wallet, is_last);
         state.db.update_diversify_route_status(*route_id, "processing", None)?;
-
         // Generate maze for this route
-        let mut params = MazeParameters::random();
-        params.hop_count = 7;
+        let params = if let Some(ref config_json) = maze_config_json {
+            if let Ok(config) = serde_json::from_str::<CustomMazeConfig>(config_json) {
+                let mut p = MazeParameters::default();
+                if let Some(hops) = config.hop_count {
+                    p.hop_count = hops.max(5).min(10);
+                }
+                if let Some(ratio) = config.split_ratio {
+                    p.split_ratio = ratio.max(1.1).min(3.0);
+                }
+                if let Some(ref strategy) = config.merge_strategy {
+                    p.merge_strategy = match strategy.as_str() {
+                        "early" => MergeStrategy::Early,
+                        "late" => MergeStrategy::Late,
+                        "middle" => MergeStrategy::Middle,
+                        "fibonacci" => MergeStrategy::Fibonacci,
+                        _ => MergeStrategy::Random,
+                    };
+                }
+                if let Some(ref pattern) = config.delay_pattern {
+                    p.delay_pattern = match pattern.as_str() {
+                        "linear" => DelayPattern::Linear,
+                        "exponential" => DelayPattern::Exponential,
+                        "random" => DelayPattern::Random,
+                        "fibonacci" => DelayPattern::Fibonacci,
+                        _ => DelayPattern::None,
+                    };
+                }
+                if let Some(ms) = config.delay_ms {
+                    p.delay_ms = ms.min(5000);
+                }
+                if let Some(ref scope) = config.delay_scope {
+                    p.delay_scope = match scope.as_str() {
+                        "level" => DelayScope::Level,
+                        _ => DelayScope::Node,
+                    };
+                }
+                p
+            } else {
+                let mut p = MazeParameters::random();
+                p.hop_count = 7;
+                p
+            }
+        } else {
+            let mut p = MazeParameters::random();
+            p.hop_count = 7;
+            p
+        };
         let generator = MazeGenerator::new(params);
         let encrypt_fn = |data: &[u8]| state.db.encrypt(data);
 
@@ -1461,7 +1756,7 @@ async fn recover_handler(
         info!("Recovering diversify request: {}", req.request_id);
         
         // Get diversify parent request
-        if let Ok(Some((deposit_address, status, keypair_encrypted, _, _, _, _, owner_meta))) = 
+        if let Ok(Some((deposit_address, status, keypair_encrypted, _, _, _, _, owner_meta, _))) = 
             state.db.get_diversify_request(&req.request_id) 
         {
             // Validate ownership - destination must be a wallet registered to the owner
@@ -1676,11 +1971,61 @@ async fn swap_request_handler(
     }
 
     let amount_lamports = sol_to_lamports(req.amount_sol);
-    let fee_lamports = (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64;
+    
+    // Hash sender meta address for subscription check
+    let mut hasher = Sha256::new();
+    hasher.update(req.sender_meta_hash.as_bytes());
+    let sender_hash = format!("{:x}", hasher.finalize());
 
-    // Generate maze parameters
-    let mut params = MazeParameters::random();
-    params.hop_count = 7; // Fixed for swap
+    // Check if sender is Pro subscriber (fee = 0)
+    let fee_lamports = if state.db.is_pro_subscriber(&sender_hash) {
+        info!("Pro subscriber detected, fee = 0");
+        0
+    } else {
+        (amount_lamports as f64 * FEE_PERCENT / 100.0) as u64
+    };
+
+
+    // Generate maze parameters (custom config or random)
+    let params = if let Some(config) = req.maze_config {
+        let mut p = MazeParameters::default();
+        p.hop_count = config.hop_count.unwrap_or(7).max(MIN_HOPS).min(MAX_HOPS);
+        if let Some(ratio) = config.split_ratio {
+            p.split_ratio = ratio.max(1.1).min(3.0);
+        }
+        if let Some(ref strategy) = config.merge_strategy {
+            p.merge_strategy = match strategy.as_str() {
+                "early" => MergeStrategy::Early,
+                "late" => MergeStrategy::Late,
+                "middle" => MergeStrategy::Middle,
+                "fibonacci" => MergeStrategy::Fibonacci,
+                _ => MergeStrategy::Random,
+            };
+        }
+        if let Some(ref pattern) = config.delay_pattern {
+            p.delay_pattern = match pattern.as_str() {
+                "linear" => DelayPattern::Linear,
+                "exponential" => DelayPattern::Exponential,
+                "random" => DelayPattern::Random,
+                "fibonacci" => DelayPattern::Fibonacci,
+                _ => DelayPattern::None,
+            };
+        }
+        if let Some(ms) = config.delay_ms {
+            p.delay_ms = ms.min(5000);
+        }
+        if let Some(ref scope) = config.delay_scope {
+            p.delay_scope = match scope.as_str() {
+                "level" => DelayScope::Level,
+                _ => DelayScope::Node,
+            };
+        }
+        p
+    } else {
+        let mut p = MazeParameters::random();
+        p.hop_count = 7; // Default for swap
+        p
+    };
 
     // Create special receiver_meta for swap: "swap:{token_mint}:{destination}"
     let swap_meta = format!("swap:{}:{}", req.token_mint, req.destination);
@@ -1718,7 +2063,7 @@ async fn swap_request_handler(
         completed_at: None,
         final_tx_signature: None,
         error_message: None,
-        sender_meta_hash: Some(req.sender_meta_hash.clone()),
+        sender_meta_hash: Some(sender_hash.clone()),
     };
 
     state.db.create_maze_request(&request, &maze)?;
@@ -1757,6 +2102,92 @@ impl Default for SwapResponse {
             expires_in: None,
             maze_preview: None,
             error: None,
+        }
+    }
+}
+
+// ============ MAZE PREFERENCES HANDLERS ============
+
+async fn get_preferences_handler(
+    State(state): State<SharedState>,
+    Json(req): Json<GetPreferencesRequest>,
+) -> Result<Json<GetPreferencesResponse>, AppError> {
+    // Hash meta address
+    let mut hasher = Sha256::new();
+    hasher.update(req.meta_address.as_bytes());
+    let meta_hash = format!("{:x}", hasher.finalize());
+
+    match state.db.get_maze_preferences(&meta_hash) {
+        Ok(Some(prefs)) => {
+            Ok(Json(GetPreferencesResponse {
+                success: true,
+                preferences: Some(MazePreferencesData {
+                    hop_count: prefs.hop_count as u8,
+                    split_ratio: prefs.split_ratio,
+                    merge_strategy: prefs.merge_strategy,
+                    delay_pattern: prefs.delay_pattern,
+                    delay_ms: prefs.delay_ms as u64,
+                    delay_scope: prefs.delay_scope,
+                    updated_at: prefs.updated_at,
+                }),
+                error: None,
+            }))
+        }
+        Ok(None) => {
+            Ok(Json(GetPreferencesResponse {
+                success: true,
+                preferences: None,
+                error: None,
+            }))
+        }
+        Err(e) => {
+            Ok(Json(GetPreferencesResponse {
+                success: false,
+                preferences: None,
+                error: Some(e.to_string()),
+            }))
+        }
+    }
+}
+
+async fn save_preferences_handler(
+    State(state): State<SharedState>,
+    Json(req): Json<SavePreferencesRequest>,
+) -> Result<Json<SavePreferencesResponse>, AppError> {
+    // Hash meta address
+    let mut hasher = Sha256::new();
+    hasher.update(req.meta_address.as_bytes());
+    let meta_hash = format!("{:x}", hasher.finalize());
+
+    let now = chrono::Utc::now().timestamp();
+
+    // Get existing or create default
+    let existing = state.db.get_maze_preferences(&meta_hash).ok().flatten();
+
+    let prefs = MazePreferencesRow {
+        owner_meta_hash: meta_hash,
+        hop_count: req.hop_count.map(|h| h as i32).unwrap_or_else(|| existing.as_ref().map(|e| e.hop_count).unwrap_or(10)),
+        split_ratio: req.split_ratio.unwrap_or_else(|| existing.as_ref().map(|e| e.split_ratio).unwrap_or(1.618)),
+        merge_strategy: req.merge_strategy.unwrap_or_else(|| existing.as_ref().map(|e| e.merge_strategy.clone()).unwrap_or_else(|| "random".to_string())),
+        delay_pattern: req.delay_pattern.unwrap_or_else(|| existing.as_ref().map(|e| e.delay_pattern.clone()).unwrap_or_else(|| "none".to_string())),
+        delay_ms: req.delay_ms.map(|d| d as i64).unwrap_or_else(|| existing.as_ref().map(|e| e.delay_ms).unwrap_or(0)),
+        delay_scope: req.delay_scope.unwrap_or_else(|| existing.as_ref().map(|e| e.delay_scope.clone()).unwrap_or_else(|| "node".to_string())),
+        updated_at: now,
+    };
+
+    match state.db.save_maze_preferences(&prefs) {
+        Ok(_) => {
+            info!("Saved maze preferences for user");
+            Ok(Json(SavePreferencesResponse {
+                success: true,
+                error: None,
+            }))
+        }
+        Err(e) => {
+            Ok(Json(SavePreferencesResponse {
+                success: false,
+                error: Some(e.to_string()),
+            }))
         }
     }
 }
@@ -1902,8 +2333,8 @@ async fn diversify_request_handler(
     let route_count = route_outputs.len() as u64;
     // Fee per route: nodes * 2 TX fees + transfer to child deposit + buffer
     let fee_per_route = TX_FEE_LAMPORTS * estimated_nodes_per_route * 3;
-    // Total: (fee per route * routes) + parent fee transfer + safety buffer (0.005 SOL)
-    let network_fee = (fee_per_route * route_count) + TX_FEE_LAMPORTS * 10 + 5_000_000;
+    // Total: (fee per route * routes) + parent fee transfer + safety buffer (0.01 SOL)
+    let network_fee = (fee_per_route * route_count) + TX_FEE_LAMPORTS * 10 + 10_000_000;
     let total_deposit = total_lamports + fee_lamports + network_fee;
 
     // Create parent diversify request
@@ -1911,7 +2342,7 @@ async fn diversify_request_handler(
     
     state.db.create_diversify_request(
         &request_id,
-        &req.meta_address,
+        &meta_hash,
         &deposit_address,
         &encrypted_keypair,
         total_lamports,
@@ -1919,6 +2350,7 @@ async fn diversify_request_handler(
         route_outputs.len(),
         &req.distribution_mode,
         EXPIRY_SECONDS,
+        req.maze_config.as_ref().map(|c| serde_json::to_string(c).ok()).flatten().as_deref(),
     )?;
 
     // Add routes to database
@@ -2047,6 +2479,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/blockhash", get(blockhash_handler))
+        .route("/submit", post(submit_handler))
         .route("/api/v1/transfer", post(create_transfer_handler))
         .route("/api/v1/transfer/:request_id", get(get_status_handler))
         .route("/api/v1/transfer/:request_id/maze", get(get_maze_graph_handler))
@@ -2070,6 +2504,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Diversify routes
         .route("/api/v1/diversify/request", post(diversify_request_handler))
         .route("/api/v1/diversify/status/:request_id", get(get_status_handler))
+        // Maze preferences
+        .route("/api/v1/preferences/maze", post(get_preferences_handler))
+        .route("/api/v1/preferences/maze/save", post(save_preferences_handler))
         .layer(cors)
         .with_state(state);
 
